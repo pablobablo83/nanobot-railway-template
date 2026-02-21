@@ -1,20 +1,19 @@
 import os
+import asyncio
+import base64
+import secrets
+import requests
+import time
 from pathlib import Path
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.templating import Jinja2Templates
-from starlette.responses import JSONResponse, HTMLResponse
+from starlette.responses import JSONResponse
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.authentication import (
     AuthenticationBackend, AuthCredentials, SimpleUser, AuthenticationError
 )
-import base64
-import secrets
-import subprocess
-import time
-
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+import uvicorn
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -22,8 +21,82 @@ if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
     print(f"Generated admin password: {ADMIN_PASSWORD}")
 
-gateway_process = None
-gateway_start_time = None
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ALLOWED_USERS = [uid.strip() for uid in os.environ.get("TELEGRAM_ALLOW_FROM", "").split(",") if uid.strip()]
+
+# Класс для управления Gateway с автоматическим переподключением
+class RobustGateway:
+    def __init__(self):
+        self.process = None
+        self.state = "stopped"
+        self.start_time = None
+        self._retry_count = 0
+        self._max_retries = 10  # Будет пытаться 10 раз
+        self._keep_running = False
+        
+    async def start(self):
+        if self.state == "running":
+            return
+        
+        self.state = "starting"
+        self._keep_running = True
+        self._retry_count = 0
+        self.start_time = time.time()
+        
+        # Запускаем в фоне с автопереподключением
+        asyncio.create_task(self._run_with_retry())
+    
+    async def _run_with_retry(self):
+        while self._keep_running:
+            try:
+                # Пытаемся запустить gateway
+                self.process = await asyncio.create_subprocess_exec(
+                    "nanobot", "gateway",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                self.state = "running"
+                self._retry_count = 0
+                
+                # Ждем завершения процесса
+                await self.process.wait()
+                
+                # Если процесс завершился, а мы должны работать - перезапускаем
+                if self._keep_running:
+                    self.state = "restarting"
+                    # Экспоненциальная задержка: 2^n секунд (но не больше 30 сек)
+                    delay = min(2 ** self._retry_count, 30)
+                    self._retry_count += 1
+                    print(f"Gateway crashed, restarting in {delay}s (attempt {self._retry_count})")
+                    await asyncio.sleep(delay)
+                    
+            except Exception as e:
+                print(f"Gateway error: {e}")
+                if self._keep_running:
+                    await asyncio.sleep(5)
+        
+        self.state = "stopped"
+        self.process = None
+    
+    async def stop(self):
+        self._keep_running = False
+        if self.process and self.process.returncode is None:
+            self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=5)
+            except:
+                self.process.kill()
+        self.state = "stopped"
+        self.start_time = None
+    
+    def get_status(self):
+        return {
+            "state": self.state,
+            "uptime": int(time.time() - self.start_time) if self.start_time and self.state == "running" else None,
+            "restarts": self._retry_count
+        }
+
+gateway = RobustGateway()
 
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
@@ -42,113 +115,27 @@ class BasicAuthBackend(AuthenticationBackend):
             pass
         raise AuthenticationError("Invalid credentials")
 
-async def homepage(request):
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>nanobot</title>
-        <style>
-            body { font-family: Arial; margin: 40px; background: #f5f5f5; }
-            .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
-            button { padding: 10px 20px; margin: 5px; cursor: pointer; }
-            .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
-            .running { background: #d4edda; color: #155724; }
-            .stopped { background: #f8d7da; color: #721c24; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>nanobot</h1>
-            <div id="status" class="status">Loading...</div>
-            <div>
-                <button onclick="start()">Start Gateway</button>
-                <button onclick="stop()">Stop Gateway</button>
-                <button onclick="restart()">Restart Gateway</button>
-            </div>
-            <pre id="log"></pre>
-        </div>
-        <script>
-            async function updateStatus() {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                const statusDiv = document.getElementById('status');
-                statusDiv.className = 'status ' + data.gateway.state;
-                statusDiv.innerHTML = 'Gateway: ' + data.gateway.state;
-            }
-            async function start() {
-                await fetch('/api/gateway/start', {method:'POST'});
-                updateStatus();
-            }
-            async function stop() {
-                await fetch('/api/gateway/stop', {method:'POST'});
-                updateStatus();
-            }
-            async function restart() {
-                await fetch('/api/gateway/restart', {method:'POST'});
-                updateStatus();
-            }
-            updateStatus();
-            setInterval(updateStatus, 2000);
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(html)
-
 async def api_status(request):
-    global gateway_process, gateway_start_time
-    state = "stopped"
-    if gateway_process and gateway_process.poll() is None:
-        state = "running"
     return JSONResponse({
-        "gateway": {
-            "state": state,
-            "uptime": int(time.time() - gateway_start_time) if gateway_start_time and state == "running" else None,
-            "restarts": 0
-        },
-        "providers": {
-            "openrouter": {"configured": bool(os.environ.get("OPENROUTER_API_KEY"))}
-        },
-        "channels": {
-            "telegram": {"enabled": bool(os.environ.get("TELEGRAM_TOKEN"))}
-        }
+        "gateway": gateway.get_status(),
+        "providers": {"openrouter": {"configured": bool(os.environ.get("OPENROUTER_API_KEY"))}},
+        "channels": {"telegram": {"enabled": bool(TELEGRAM_TOKEN)}}
     })
 
 async def api_gateway_start(request):
-    global gateway_process, gateway_start_time
-    try:
-        if gateway_process and gateway_process.poll() is None:
-            return JSONResponse({"ok": True})
-        gateway_process = subprocess.Popen(
-            ["nanobot", "gateway"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        gateway_start_time = time.time()
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    await gateway.start()
+    return JSONResponse({"ok": True})
 
 async def api_gateway_stop(request):
-    global gateway_process, gateway_start_time
-    try:
-        if gateway_process and gateway_process.poll() is None:
-            gateway_process.terminate()
-            gateway_process.wait(timeout=10)
-        gateway_process = None
-        gateway_start_time = None
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    await gateway.stop()
+    return JSONResponse({"ok": True})
 
 async def api_gateway_restart(request):
-    await api_gateway_stop(request)
-    await api_gateway_start(request)
+    await gateway.stop()
+    await gateway.start()
     return JSONResponse({"ok": True})
 
 routes = [
-    Route("/", homepage),
     Route("/api/status", api_status),
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
@@ -161,6 +148,5 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)

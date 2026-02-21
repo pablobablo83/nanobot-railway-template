@@ -3,7 +3,7 @@ from pathlib import Path
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.templating import Jinja2Templates
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, HTMLResponse
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.authentication import (
@@ -22,7 +22,6 @@ if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
     print(f"Generated admin password: {ADMIN_PASSWORD}")
 
-# Глобальные переменные для хранения состояния Gateway
 gateway_process = None
 gateway_start_time = None
 
@@ -44,7 +43,58 @@ class BasicAuthBackend(AuthenticationBackend):
         raise AuthenticationError("Invalid credentials")
 
 async def homepage(request):
-    return templates.TemplateResponse(request, "index.html")
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>nanobot</title>
+        <style>
+            body { font-family: Arial; margin: 40px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+            button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+            .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+            .running { background: #d4edda; color: #155724; }
+            .stopped { background: #f8d7da; color: #721c24; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>nanobot</h1>
+            <div id="status" class="status">Loading...</div>
+            <div>
+                <button onclick="start()">Start Gateway</button>
+                <button onclick="stop()">Stop Gateway</button>
+                <button onclick="restart()">Restart Gateway</button>
+            </div>
+            <pre id="log"></pre>
+        </div>
+        <script>
+            async function updateStatus() {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const statusDiv = document.getElementById('status');
+                statusDiv.className = 'status ' + data.gateway.state;
+                statusDiv.innerHTML = 'Gateway: ' + data.gateway.state;
+            }
+            async function start() {
+                await fetch('/api/gateway/start', {method:'POST'});
+                updateStatus();
+            }
+            async function stop() {
+                await fetch('/api/gateway/stop', {method:'POST'});
+                updateStatus();
+            }
+            async function restart() {
+                await fetch('/api/gateway/restart', {method:'POST'});
+                updateStatus();
+            }
+            updateStatus();
+            setInterval(updateStatus, 2000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 async def api_status(request):
     global gateway_process, gateway_start_time
@@ -69,8 +119,7 @@ async def api_gateway_start(request):
     global gateway_process, gateway_start_time
     try:
         if gateway_process and gateway_process.poll() is None:
-            return JSONResponse({"ok": True, "message": "already running"})
-        
+            return JSONResponse({"ok": True})
         gateway_process = subprocess.Popen(
             ["nanobot", "gateway"],
             stdout=subprocess.PIPE,

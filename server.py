@@ -24,6 +24,7 @@ from starlette.routing import Route
 from starlette.templating import Jinja2Templates
 
 from nanobot.config.loader import (
+    ConfigLoader,
     convert_keys,
     convert_to_camel,
     load_config,
